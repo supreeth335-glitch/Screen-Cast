@@ -1,0 +1,642 @@
+name: Build APK
+on: [push, workflow_dispatch]
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+      - name: Write project and build
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir proj && cd proj
+          mkdir -p $(dirname 'app/build.gradle.kts')
+          cat > 'app/build.gradle.kts' <<'EOF_0'
+          plugins { id("com.android.application"); id("org.jetbrains.kotlin.android") }
+          android {
+              namespace = "com.example.castshare"
+              compileSdk = 34
+              defaultConfig { applicationId = "com.example.castshare"; minSdk = 29; targetSdk = 34; versionCode = 1; versionName = "1.0" }
+              compileOptions { sourceCompatibility = JavaVersion.VERSION_17; targetCompatibility = JavaVersion.VERSION_17 }
+              kotlinOptions { jvmTarget = "17" }
+          }
+
+          EOF_0
+          mkdir -p $(dirname 'app/src/main/AndroidManifest.xml')
+          cat > 'app/src/main/AndroidManifest.xml' <<'EOF_1'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.INTERNET"/>
+              <uses-permission android:name="android.permission.ACCESS_WIFI_STATE"/>
+              <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>
+              <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE"/>
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION"/>
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC"/>
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
+              <application android:label="CastShare" android:theme="@android:style/Theme.Material.NoActionBar">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN"/>
+                          <category android:name="android.intent.category.LAUNCHER"/>
+                      </intent-filter>
+                  </activity>
+                  <activity android:name=".ViewerActivity" android:exported="false"
+                      android:theme="@android:style/Theme.Black.NoTitleBar.Fullscreen"
+                      android:configChanges="orientation|screenSize|keyboardHidden"/>
+                  <service android:name=".ReceiverService" android:exported="false" android:foregroundServiceType="dataSync"/>
+                  <service android:name=".CastService" android:exported="false" android:foregroundServiceType="mediaProjection"/>
+              </application>
+          </manifest>
+
+          EOF_1
+          mkdir -p $(dirname 'app/src/main/java/com/example/castshare/CastService.kt')
+          cat > 'app/src/main/java/com/example/castshare/CastService.kt' <<'EOF_2'
+          package com.example.castshare
+
+          import android.app.*
+          import android.content.Intent
+          import android.content.pm.ServiceInfo
+          import android.graphics.drawable.Icon
+          import android.hardware.display.DisplayManager
+          import android.hardware.display.VirtualDisplay
+          import android.media.MediaCodec
+          import android.media.MediaCodecInfo
+          import android.media.MediaFormat
+          import android.media.projection.MediaProjection
+          import android.media.projection.MediaProjectionManager
+          import android.os.Handler
+          import android.os.IBinder
+          import android.os.Looper
+          import android.view.WindowManager
+          import java.io.*
+          import java.net.*
+
+          /** Sender side: captures the screen, hardware-encodes it (HEVC/H.264, up to 4K) and streams it. */
+          class CastService : Service() {
+              @Volatile private var active = false
+
+              override fun onBind(i: Intent?): IBinder? = null
+
+              override fun onStartCommand(i: Intent?, f: Int, id: Int): Int {
+                  if (i == null || i.action == "STOP") { active = false; stopSelf(); return START_NOT_STICKY }
+                  if (active) return START_NOT_STICKY
+                  active = true
+                  val nm = getSystemService(NotificationManager::class.java)
+                  nm.createNotificationChannel(NotificationChannel("cast", "Casting", NotificationManager.IMPORTANCE_LOW))
+                  val stop = PendingIntent.getService(this, 0, Intent(this, CastService::class.java).setAction("STOP"), PendingIntent.FLAG_IMMUTABLE)
+                  val act = Notification.Action.Builder(Icon.createWithResource(this, android.R.drawable.ic_media_pause), "Stop", stop).build()
+                  val n = Notification.Builder(this, "cast").setSmallIcon(android.R.drawable.ic_menu_share)
+                      .setContentTitle("Casting your screen").addAction(act).build()
+                  startForeground(2, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION)
+                  val code = i.getIntExtra("code", 0)
+                  val data = i.getParcelableExtra<Intent>("data")
+                  val host = i.getStringExtra("host")
+                  if (data == null || host == null) { stopSelf(); return START_NOT_STICKY }
+                  Thread { cast(code, data, host) }.start()
+                  return START_NOT_STICKY
+              }
+
+              private fun cast(code: Int, data: Intent, host: String) {
+                  var proj: MediaProjection? = null
+                  var enc: MediaCodec? = null
+                  var vd: VirtualDisplay? = null
+                  var sock: Socket? = null
+                  try {
+                      val mpm = getSystemService(MediaProjectionManager::class.java)
+                      val pj = mpm.getMediaProjection(code, data)
+                      proj = pj
+                      pj.registerCallback(object : MediaProjection.Callback() {
+                          override fun onStop() { active = false }
+                      }, Handler(Looper.getMainLooper()))
+
+                      val b = getSystemService(WindowManager::class.java).currentWindowMetrics.bounds
+                      var w = b.width(); var h = b.height()
+                      val big = maxOf(w, h)
+                      if (big > 3840) { val s = 3840f / big; w = (w * s).toInt(); h = (h * s).toInt() }
+                      w = w / 16 * 16; h = h / 16 * 16
+                      val k = 1920f / maxOf(w, h)
+                      val tries = listOf(
+                          Triple("video/hevc", w, h), Triple("video/avc", w, h),
+                          Triple("video/avc", (w * k).toInt() / 16 * 16, (h * k).toInt() / 16 * 16))
+                      var mime = ""
+                      for ((m, tw, th) in tries) {
+                          try {
+                              val f = MediaFormat.createVideoFormat(m, tw, th)
+                              f.setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
+                              f.setInteger(MediaFormat.KEY_BIT_RATE, minOf(40_000_000L, tw.toLong() * th * 5).toInt())
+                              f.setInteger(MediaFormat.KEY_FRAME_RATE, 60)
+                              f.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
+                              f.setLong(MediaFormat.KEY_REPEAT_PREVIOUS_FRAME_AFTER, 100_000L)
+                              val e = MediaCodec.createEncoderByType(m)
+                              try { e.configure(f, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE) }
+                              catch (x: Exception) { e.release(); throw x }
+                              enc = e; mime = m; w = tw; h = th
+                              break
+                          } catch (x: Exception) {}
+                      }
+                      val e2 = enc ?: throw Exception("No encoder")
+                      val surf = e2.createInputSurface()
+                      e2.start()
+                      vd = pj.createVirtualDisplay("cast", w, h, resources.displayMetrics.densityDpi,
+                          DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR, surf, null, null)
+
+                      val sk = Socket()
+                      sock = sk
+                      sk.connect(InetSocketAddress(host, 45455), 5000)
+                      val out = DataOutputStream(BufferedOutputStream(sk.getOutputStream(), 1 shl 20))
+                      out.writeByte('S'.code); out.writeInt(w); out.writeInt(h); out.writeUTF(mime); out.flush()
+                      val info = MediaCodec.BufferInfo()
+                      while (active) {
+                          val i = e2.dequeueOutputBuffer(info, 100000)
+                          if (i >= 0) {
+                              val bb = e2.getOutputBuffer(i)!!
+                              val arr = ByteArray(info.size)
+                              bb.position(info.offset); bb.get(arr)
+                              out.writeInt(arr.size); out.writeLong(info.presentationTimeUs); out.writeInt(info.flags)
+                              out.write(arr); out.flush()
+                              e2.releaseOutputBuffer(i, false)
+                          }
+                      }
+                  } catch (e: Exception) {
+                  } finally {
+                      try { vd?.release() } catch (e: Exception) {}
+                      try { enc?.stop() } catch (e: Exception) {}
+                      try { enc?.release() } catch (e: Exception) {}
+                      try { proj?.stop() } catch (e: Exception) {}
+                      try { sock?.close() } catch (e: Exception) {}
+                      active = false
+                      stopSelf()
+                  }
+              }
+          }
+
+          EOF_2
+          mkdir -p $(dirname 'app/src/main/java/com/example/castshare/Hub.kt')
+          cat > 'app/src/main/java/com/example/castshare/Hub.kt' <<'EOF_3'
+          package com.example.castshare
+
+          import android.app.*
+          import android.content.Context
+          import android.content.Intent
+          import android.media.MediaCodec
+          import android.media.MediaFormat
+          import android.view.Surface
+          import java.io.DataInputStream
+
+          /** Receiver side: decodes the incoming screen stream onto the viewer surface. */
+          object Hub {
+              @Volatile var surface: Surface? = null
+              @Volatile var onIncoming: (() -> Unit)? = null
+              @Volatile var onEnd: (() -> Unit)? = null
+              @Volatile var onSize: ((Int, Int) -> Unit)? = null
+
+              fun screen(inp: DataInputStream, ctx: Context) {
+                  val w = inp.readInt(); val h = inp.readInt(); val mime = inp.readUTF()
+                  val cb = onIncoming
+                  if (cb != null) {
+                      cb()
+                  } else {
+                      val nm = ctx.getSystemService(NotificationManager::class.java)
+                      nm.createNotificationChannel(NotificationChannel("alerts", "Incoming", NotificationManager.IMPORTANCE_HIGH))
+                      val pi = PendingIntent.getActivity(ctx, 0, Intent(ctx, ViewerActivity::class.java), PendingIntent.FLAG_IMMUTABLE)
+                      nm.notify(9, Notification.Builder(ctx, "alerts").setSmallIcon(android.R.drawable.ic_menu_view)
+                          .setContentTitle("Screen incoming").setContentText("Tap to watch").setContentIntent(pi).setAutoCancel(true).build())
+                  }
+                  var t = 0
+                  while (surface == null && t < 600) { Thread.sleep(100); t++ }
+                  val s = surface ?: return
+                  onSize?.invoke(w, h)
+                  val codec = MediaCodec.createDecoderByType(mime)
+                  codec.configure(MediaFormat.createVideoFormat(mime, w, h), s, null, 0)
+                  codec.start()
+                  val info = MediaCodec.BufferInfo()
+                  try {
+                      while (surface != null) {
+                          val len = inp.readInt(); val pts = inp.readLong(); val flags = inp.readInt()
+                          val d = ByteArray(len); inp.readFully(d)
+                          var i = codec.dequeueInputBuffer(100000)
+                          while (i < 0 && surface != null) i = codec.dequeueInputBuffer(100000)
+                          if (i < 0) break
+                          val ib = codec.getInputBuffer(i)!!
+                          ib.clear(); ib.put(d)
+                          codec.queueInputBuffer(i, 0, len, pts, flags)
+                          while (true) {
+                              val o = codec.dequeueOutputBuffer(info, 0)
+                              if (o >= 0) codec.releaseOutputBuffer(o, true) else break
+                          }
+                      }
+                  } catch (e: Exception) {
+                  } finally {
+                      try { codec.stop() } catch (e: Exception) {}
+                      codec.release()
+                      onEnd?.invoke()
+                  }
+              }
+          }
+
+          EOF_3
+          mkdir -p $(dirname 'app/src/main/java/com/example/castshare/MainActivity.kt')
+          cat > 'app/src/main/java/com/example/castshare/MainActivity.kt' <<'EOF_4'
+          package com.example.castshare
+
+          import android.Manifest
+          import android.app.Activity
+          import android.content.Intent
+          import android.graphics.Color
+          import android.graphics.drawable.GradientDrawable
+          import android.media.projection.MediaProjectionManager
+          import android.net.Uri
+          import android.os.*
+          import android.provider.OpenableColumns
+          import android.provider.Settings
+          import android.widget.*
+          import java.io.*
+          import java.net.*
+
+          data class Peer(val name: String, val host: String)
+
+          class MainActivity : Activity() {
+              private var peer: Peer? = null
+              private lateinit var info: TextView
+              private lateinit var list: LinearLayout
+              private lateinit var bar: ProgressBar
+              private val ui = Handler(Looper.getMainLooper())
+
+              private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+              private fun bg(color: Int, r: Int): GradientDrawable {
+                  val g = GradientDrawable(); g.setColor(color); g.cornerRadius = dp(r).toFloat(); return g
+              }
+              private fun lp(top: Int): LinearLayout.LayoutParams {
+                  val p = LinearLayout.LayoutParams(-1, -2); p.topMargin = dp(top); return p
+              }
+              private fun tv(t: String, size: Float, color: Int, bold: Boolean): TextView {
+                  val v = TextView(this); v.text = t; v.textSize = size; v.setTextColor(color)
+                  if (bold) v.setTypeface(null, android.graphics.Typeface.BOLD)
+                  v.layoutParams = lp(4); return v
+              }
+              private fun btn(t: String, color: Int, f: () -> Unit): Button {
+                  val b = Button(this); b.text = t; b.isAllCaps = false; b.setTextColor(Color.WHITE); b.textSize = 16f
+                  b.background = bg(color, 16); b.layoutParams = lp(10); b.setOnClickListener { f() }; return b
+              }
+              private fun card(): LinearLayout {
+                  val c = LinearLayout(this); c.orientation = LinearLayout.VERTICAL
+                  c.background = bg(0xFF1B2440.toInt(), 24); c.setPadding(dp(20), dp(16), dp(20), dp(18))
+                  c.layoutParams = lp(16); return c
+              }
+
+              override fun onCreate(b: Bundle?) {
+                  super.onCreate(b)
+                  if (Build.VERSION.SDK_INT >= 33) requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 1)
+                  val muted = 0xFF9AA4C0.toInt()
+                  val root = LinearLayout(this)
+                  root.orientation = LinearLayout.VERTICAL
+                  root.setPadding(dp(18), dp(48), dp(18), dp(24))
+                  root.addView(tv("CastShare", 32f, Color.WHITE, true))
+                  root.addView(tv("Mirror up to 4K and send files at full Wi-Fi speed", 14f, muted, false))
+
+                  val c1 = card()
+                  c1.addView(tv("Receive", 18f, Color.WHITE, true))
+                  val status = tv("Off", 13f, muted, false)
+                  val sw = Switch(this)
+                  sw.text = "Receive mode"; sw.setTextColor(Color.WHITE)
+                  sw.setOnCheckedChangeListener { _, on ->
+                      val i = Intent(this, ReceiverService::class.java)
+                      if (on) startForegroundService(i) else startService(i.setAction("STOP"))
+                      status.text = if (on) "Ready. Other phones can find this device." else "Off"
+                  }
+                  c1.addView(sw); c1.addView(status); root.addView(c1)
+
+                  val c2 = card()
+                  c2.addView(tv("Nearby devices", 18f, Color.WHITE, true))
+                  list = LinearLayout(this); list.orientation = LinearLayout.VERTICAL
+                  c2.addView(btn("Scan", 0xFF2F3B66.toInt()) { scan() })
+                  c2.addView(list)
+                  info = tv("Both phones need CastShare and the same Wi-Fi or hotspot.", 13f, muted, false)
+                  c2.addView(info); root.addView(c2)
+
+                  val c3 = card()
+                  c3.addView(tv("Share", 18f, Color.WHITE, true))
+                  c3.addView(btn("Cast my screen", 0xFF7C3AED.toInt()) { castScreen() })
+                  c3.addView(btn("Send files", 0xFF0891B2.toInt()) { pickFiles() })
+                  bar = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal)
+                  bar.max = 100; bar.layoutParams = lp(12); c3.addView(bar)
+                  c3.addView(btn("Audio output (Bluetooth)", 0xFF2F3B66.toInt()) {
+                      startActivity(Intent(Settings.ACTION_BLUETOOTH_SETTINGS))
+                  })
+                  root.addView(c3)
+
+                  val sc = ScrollView(this)
+                  sc.background = GradientDrawable(GradientDrawable.Orientation.TOP_BOTTOM, intArrayOf(0xFF0B1020.toInt(), 0xFF241B4B.toInt()))
+                  sc.addView(root)
+                  setContentView(sc)
+              }
+
+              override fun onResume() {
+                  super.onResume()
+                  Hub.onIncoming = { ui.post { startActivity(Intent(this, ViewerActivity::class.java)) } }
+              }
+
+              override fun onPause() { Hub.onIncoming = null; super.onPause() }
+
+              private fun scan() {
+                  info.text = "Scanning..."
+                  Thread {
+                      val found = mutableMapOf<String, Peer>()
+                      try {
+                          val s = DatagramSocket()
+                          s.broadcast = true; s.soTimeout = 400
+                          val msg = "CASTSHARE?".toByteArray()
+                          repeat(2) { s.send(DatagramPacket(msg, msg.size, InetAddress.getByName("255.255.255.255"), 45454)) }
+                          val end = System.currentTimeMillis() + 2500
+                          val buf = ByteArray(256)
+                          while (System.currentTimeMillis() < end) {
+                              try {
+                                  val p = DatagramPacket(buf, buf.size)
+                                  s.receive(p)
+                                  val parts = String(p.data, 0, p.length).split("|")
+                                  val ip = p.address.hostAddress
+                                  if (parts.size >= 2 && parts[0] == "CASTSHARE!" && ip != null) found[ip] = Peer(parts[1], ip)
+                              } catch (e: SocketTimeoutException) {}
+                          }
+                          s.close()
+                      } catch (e: Exception) {}
+                      ui.post { showPeers(found.values.toList()) }
+                  }.start()
+              }
+
+              private fun showPeers(peers: List<Peer>) {
+                  list.removeAllViews()
+                  if (peers.isEmpty()) {
+                      info.text = "No devices found. On the other phone, open CastShare and turn on Receive mode."
+                      return
+                  }
+                  info.text = "Tap a device to select it."
+                  for (p in peers) list.addView(btn(p.name, 0xFF3B4A7A.toInt()) { peer = p; info.text = "Selected: ${p.name}" })
+              }
+
+              private fun castScreen() {
+                  if (peer == null) { info.text = "Scan and select a device first."; return }
+                  val mpm = getSystemService(MediaProjectionManager::class.java)
+                  startActivityForResult(mpm.createScreenCaptureIntent(), 100)
+              }
+
+              private fun pickFiles() {
+                  if (peer == null) { info.text = "Scan and select a device first."; return }
+                  val i = Intent(Intent.ACTION_OPEN_DOCUMENT)
+                  i.addCategory(Intent.CATEGORY_OPENABLE); i.type = "*/*"
+                  i.putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true)
+                  startActivityForResult(i, 101)
+              }
+
+              override fun onActivityResult(req: Int, res: Int, data: Intent?) {
+                  super.onActivityResult(req, res, data)
+                  if (res != RESULT_OK || data == null) return
+                  val p = peer ?: return
+                  if (req == 100) {
+                      val i = Intent(this, CastService::class.java)
+                      i.putExtra("code", res); i.putExtra("data", data); i.putExtra("host", p.host)
+                      startForegroundService(i)
+                      info.text = "Casting to ${p.name}. Use the notification to stop."
+                  } else if (req == 101) {
+                      val l = mutableListOf<Uri>()
+                      val cd = data.clipData
+                      if (cd != null) {
+                          for (n in 0 until cd.itemCount) l.add(cd.getItemAt(n).uri)
+                      } else {
+                          data.data?.let { l.add(it) }
+                      }
+                      sendFiles(p, l)
+                  }
+              }
+
+              private fun sendFiles(p: Peer, uris: List<Uri>) {
+                  Thread {
+                      try {
+                          for ((n, u) in uris.withIndex()) {
+                              var name = "file"; var size = 0L
+                              val c = contentResolver.query(u, null, null, null, null)
+                              if (c != null) {
+                                  if (c.moveToFirst()) {
+                                      val a = c.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                                      val z = c.getColumnIndex(OpenableColumns.SIZE)
+                                      if (a >= 0) name = c.getString(a)
+                                      if (z >= 0) size = c.getLong(z)
+                                  }
+                                  c.close()
+                              }
+                              val s = Socket()
+                              s.sendBufferSize = 1 shl 20
+                              s.connect(InetSocketAddress(p.host, 45455), 5000)
+                              val out = DataOutputStream(BufferedOutputStream(s.getOutputStream(), 1 shl 20))
+                              out.writeByte('F'.code); out.writeUTF(name); out.writeLong(size)
+                              val buf = ByteArray(1 shl 20)
+                              var sent = 0L; var last = 0L
+                              val ins = contentResolver.openInputStream(u)!!
+                              while (true) {
+                                  val r = ins.read(buf)
+                                  if (r < 0) break
+                                  out.write(buf, 0, r); sent += r
+                                  val now = System.currentTimeMillis()
+                                  if (now - last > 300) {
+                                      last = now
+                                      val pct = if (size > 0) (sent * 100 / size).toInt() else 0
+                                      ui.post { bar.progress = pct; info.text = "Sending ${n + 1}/${uris.size}: $name $pct%" }
+                                  }
+                              }
+                              ins.close(); out.flush(); s.close()
+                          }
+                          ui.post { bar.progress = 100; info.text = "Sent ${uris.size} file(s)" }
+                      } catch (e: Exception) {
+                          ui.post { info.text = "Failed: ${e.message}" }
+                      }
+                  }.start()
+              }
+          }
+
+          EOF_4
+          mkdir -p $(dirname 'app/src/main/java/com/example/castshare/ReceiverService.kt')
+          cat > 'app/src/main/java/com/example/castshare/ReceiverService.kt' <<'EOF_5'
+          package com.example.castshare
+
+          import android.app.*
+          import android.content.ContentValues
+          import android.content.Context
+          import android.content.Intent
+          import android.content.pm.ServiceInfo
+          import android.net.wifi.WifiManager
+          import android.os.Build
+          import android.os.IBinder
+          import android.provider.MediaStore
+          import android.provider.Settings
+          import java.io.*
+          import java.net.*
+
+          class ReceiverService : Service() {
+              @Volatile private var running = false
+              private var tcp: ServerSocket? = null
+              private var udp: DatagramSocket? = null
+              private var lock: WifiManager.MulticastLock? = null
+
+              override fun onBind(i: Intent?): IBinder? = null
+
+              override fun onStartCommand(i: Intent?, f: Int, id: Int): Int {
+                  if (i?.action == "STOP") { shutdown(); stopSelf(); return START_NOT_STICKY }
+                  if (!running) {
+                      running = true
+                      val nm = getSystemService(NotificationManager::class.java)
+                      nm.createNotificationChannel(NotificationChannel("svc", "Receiver", NotificationManager.IMPORTANCE_LOW))
+                      val n = Notification.Builder(this, "svc").setSmallIcon(android.R.drawable.stat_sys_download)
+                          .setContentTitle("CastShare is receiving").setContentText("Ready for screens and files").build()
+                      startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
+                      val wm = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
+                      lock = wm.createMulticastLock("castshare")
+                      lock?.acquire()
+                      Thread { udpLoop() }.start()
+                      Thread { tcpLoop() }.start()
+                  }
+                  return START_STICKY
+              }
+
+              override fun onDestroy() { shutdown() }
+
+              private fun shutdown() {
+                  running = false
+                  try { tcp?.close() } catch (e: Exception) {}
+                  try { udp?.close() } catch (e: Exception) {}
+                  try { lock?.release() } catch (e: Exception) {}
+              }
+
+              private fun udpLoop() {
+                  try {
+                      val s = DatagramSocket(null)
+                      s.reuseAddress = true
+                      s.bind(InetSocketAddress(45454))
+                      udp = s
+                      val name = Settings.Global.getString(contentResolver, "device_name") ?: Build.MODEL
+                      val buf = ByteArray(256)
+                      while (running) {
+                          val p = DatagramPacket(buf, buf.size)
+                          s.receive(p)
+                          if (String(p.data, 0, p.length) == "CASTSHARE?") {
+                              val r = "CASTSHARE!|$name".toByteArray()
+                              s.send(DatagramPacket(r, r.size, p.address, p.port))
+                          }
+                      }
+                  } catch (e: Exception) {}
+              }
+
+              private fun tcpLoop() {
+                  try {
+                      val s = ServerSocket()
+                      s.reuseAddress = true
+                      s.bind(InetSocketAddress(45455))
+                      tcp = s
+                      while (running) {
+                          val c = s.accept()
+                          Thread { handle(c) }.start()
+                      }
+                  } catch (e: Exception) {}
+              }
+
+              private fun handle(c: Socket) {
+                  try {
+                      c.use {
+                          val inp = DataInputStream(BufferedInputStream(c.getInputStream(), 1 shl 20))
+                          val type = inp.readByte().toInt().toChar()
+                          if (type == 'F') receiveFile(inp)
+                          else if (type == 'S') Hub.screen(inp, this)
+                      }
+                  } catch (e: Exception) {}
+              }
+
+              private fun receiveFile(inp: DataInputStream) {
+                  val name = inp.readUTF(); val size = inp.readLong()
+                  val v = ContentValues()
+                  v.put(MediaStore.Downloads.DISPLAY_NAME, name)
+                  v.put(MediaStore.Downloads.RELATIVE_PATH, "Download/CastShare")
+                  val uri = contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, v) ?: return
+                  contentResolver.openOutputStream(uri)!!.use { o ->
+                      val buf = ByteArray(1 shl 20)
+                      var left = size
+                      while (left > 0) {
+                          val r = inp.read(buf, 0, minOf(buf.size.toLong(), left).toInt())
+                          if (r < 0) break
+                          o.write(buf, 0, r); left -= r
+                      }
+                  }
+                  val nm = getSystemService(NotificationManager::class.java)
+                  nm.notify(name.hashCode(), Notification.Builder(this, "svc").setSmallIcon(android.R.drawable.stat_sys_download_done)
+                      .setContentTitle("Received").setContentText("$name saved to Downloads/CastShare").build())
+              }
+          }
+
+          EOF_5
+          mkdir -p $(dirname 'app/src/main/java/com/example/castshare/ViewerActivity.kt')
+          cat > 'app/src/main/java/com/example/castshare/ViewerActivity.kt' <<'EOF_6'
+          package com.example.castshare
+
+          import android.app.Activity
+          import android.os.Bundle
+          import android.view.*
+          import android.widget.FrameLayout
+
+          class ViewerActivity : Activity() {
+              override fun onCreate(b: Bundle?) {
+                  super.onCreate(b)
+                  window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                  val root = FrameLayout(this)
+                  root.setBackgroundColor(0xFF000000.toInt())
+                  val sv = SurfaceView(this)
+                  root.addView(sv, FrameLayout.LayoutParams(-1, -1, Gravity.CENTER))
+                  setContentView(root)
+                  sv.holder.addCallback(object : SurfaceHolder.Callback {
+                      override fun surfaceCreated(h: SurfaceHolder) { Hub.surface = h.surface }
+                      override fun surfaceChanged(h: SurfaceHolder, f: Int, w: Int, ht: Int) {}
+                      override fun surfaceDestroyed(h: SurfaceHolder) { Hub.surface = null }
+                  })
+                  Hub.onSize = { w, h ->
+                      runOnUiThread {
+                          val sc = minOf(root.width / w.toFloat(), root.height / h.toFloat())
+                          sv.layoutParams = FrameLayout.LayoutParams((w * sc).toInt(), (h * sc).toInt(), Gravity.CENTER)
+                      }
+                  }
+                  Hub.onEnd = { runOnUiThread { finish() } }
+              }
+
+              override fun onDestroy() { Hub.onSize = null; Hub.onEnd = null; super.onDestroy() }
+          }
+
+          EOF_6
+          mkdir -p $(dirname 'build.gradle.kts')
+          cat > 'build.gradle.kts' <<'EOF_7'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+
+          EOF_7
+          mkdir -p $(dirname 'gradle.properties')
+          cat > 'gradle.properties' <<'EOF_8'
+          android.useAndroidX=true
+
+          EOF_8
+          mkdir -p $(dirname 'settings.gradle.kts')
+          cat > 'settings.gradle.kts' <<'EOF_9'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "CastShare"
+          include(":app")
+
+          EOF_9
+          gradle assembleDebug --no-daemon
+          cp app/build/outputs/apk/debug/app-debug.apk ../CastShare.apk
+          cd .. && gh release create v${{ github.run_number }} CastShare.apk --repo ${{ github.repository }} --title "CastShare build ${{ github.run_number }}" --notes "Download CastShare.apk"
