@@ -33,7 +33,10 @@ jobs:
               compileOptions { sourceCompatibility = JavaVersion.VERSION_17; targetCompatibility = JavaVersion.VERSION_17 }
               kotlinOptions { jvmTarget = "17" }
           }
-          dependencies { implementation("org.videolan.android:libvlc-all:3.6.0") }
+          dependencies {
+              implementation("org.videolan.android:libvlc-all:3.6.0")
+              implementation("com.google.zxing:core:3.5.3")
+          }
 
           EOF_0
           mkdir -p $(dirname 'app/src/main/AndroidManifest.xml')
@@ -52,7 +55,7 @@ jobs:
               <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC"/>
               <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK"/>
               <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
-              <application android:label="CastShare" android:theme="@android:style/Theme.Material.NoActionBar">
+              <application android:label="CastShare" android:allowBackup="false" android:usesCleartextTraffic="false" android:theme="@android:style/Theme.Material.NoActionBar">
                   <activity android:name=".MainActivity" android:exported="true">
                       <intent-filter>
                           <action android:name="android.intent.action.MAIN"/>
@@ -65,6 +68,9 @@ jobs:
                   <activity android:name=".PlayerActivity" android:exported="false"
                       android:theme="@android:style/Theme.Black.NoTitleBar.Fullscreen"
                       android:configChanges="orientation|screenSize|keyboardHidden|smallestScreenSize|screenLayout"/>
+                  <activity android:name=".WebActivity" android:exported="false"/>
+                  <activity android:name=".BrowserActivity" android:exported="false" android:configChanges="orientation|screenSize|keyboardHidden"/>
+                  <service android:name=".WebService" android:exported="false" android:foregroundServiceType="dataSync"/>
                   <service android:name=".ReceiverService" android:exported="false" android:foregroundServiceType="dataSync"/>
                   <service android:name=".ServeService" android:exported="false" android:foregroundServiceType="dataSync"/>
                   <service android:name=".CastService" android:exported="false" android:foregroundServiceType="mediaProjection"/>
@@ -73,8 +79,230 @@ jobs:
           </manifest>
 
           EOF_1
+          mkdir -p $(dirname 'app/src/main/java/com/example/castshare/BrowserActivity.kt')
+          cat > 'app/src/main/java/com/example/castshare/BrowserActivity.kt' <<'EOF_2'
+          package com.example.castshare
+
+          import android.app.Activity
+          import android.app.AlertDialog
+          import android.app.DownloadManager
+          import android.content.Intent
+          import android.graphics.Color
+          import android.media.projection.MediaProjectionManager
+          import android.net.Uri
+          import android.os.Bundle
+          import android.os.Environment
+          import android.view.View
+          import android.view.inputmethod.EditorInfo
+          import android.webkit.*
+          import android.widget.*
+          import java.io.ByteArrayInputStream
+          import java.io.DataOutputStream
+          import java.net.InetSocketAddress
+          import java.net.Socket
+          import java.net.URLEncoder
+
+          /** Private browser: no accounts, no analytics, HTTPS-only, tracker blocking, encrypted history and bookmarks. */
+          class BrowserActivity : Activity() {
+              private lateinit var wv: WebView
+              private lateinit var addr: EditText
+              private lateinit var bar: ProgressBar
+              private lateinit var castV: Button
+              private lateinit var privB: Button
+              private lateinit var shB: Button
+              private var priv = false; private var block = true; private var blocked = 0
+              private var media: String? = null; private var pageTitle = ""
+              private val ads = listOf("doubleclick.net", "googlesyndication.com", "google-analytics.com", "googletagmanager.com",
+                  "googletagservices.com", "adservice.google.com", "facebook.net", "connect.facebook.net", "scorecardresearch.com",
+                  "taboola.com", "outbrain.com", "criteo.com", "criteo.net", "adnxs.com", "hotjar.com", "mixpanel.com", "segment.io",
+                  "amplitude.com", "mc.yandex.ru", "adsrvr.org", "rubiconproject.com", "pubmatic.com", "openx.net", "quantserve.com",
+                  "chartbeat.com", "newrelic.com", "moatads.com", "bat.bing.com", "ads.twitter.com", "analytics.tiktok.com", "app-measurement.com")
+
+              private fun toast(t: String) = Toast.makeText(this, t, Toast.LENGTH_SHORT).show()
+              private fun clean(s: String) = s.replace('\n', ' ').replace('\t', ' ')
+
+              private fun go(t: String) {
+                  val s = t.trim()
+                  val u = if (s.startsWith("https://")) s
+                  else if (s.startsWith("http://")) "https://" + s.removePrefix("http://")
+                  else if (s.contains(' ') || !s.contains('.')) "https://duckduckgo.com/?q=" + URLEncoder.encode(s, "UTF-8")
+                  else "https://$s"
+                  wv.loadUrl(u, mapOf("DNT" to "1", "Sec-GPC" to "1"))
+              }
+
+              private fun tb(label: String, f: () -> Unit): Button {
+                  val b = Button(this); b.text = label; b.isAllCaps = false; b.setTextColor(Color.WHITE)
+                  b.setBackgroundColor(0x00000000); b.setOnClickListener { f() }; return b
+              }
+
+              override fun onCreate(b: Bundle?) {
+                  super.onCreate(b)
+                  val root = LinearLayout(this)
+                  root.orientation = LinearLayout.VERTICAL
+                  root.setBackgroundColor(0xFF0B1020.toInt())
+                  addr = EditText(this)
+                  addr.setSingleLine(); addr.setTextColor(Color.WHITE); addr.setHintTextColor(0xFF9AA4C0.toInt())
+                  addr.hint = "Search or type a web address"; addr.imeOptions = EditorInfo.IME_ACTION_GO
+                  addr.setPadding(24, 56, 24, 16)
+                  addr.setOnEditorActionListener { _, _, _ -> go(addr.text.toString()); true }
+                  bar = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal)
+                  bar.max = 100
+                  wv = WebView(this)
+                  root.addView(addr); root.addView(bar, LinearLayout.LayoutParams(-1, 8))
+                  root.addView(wv, LinearLayout.LayoutParams(-1, 0, 1f))
+
+                  val row = LinearLayout(this)
+                  row.addView(tb("Back") { if (wv.canGoBack()) wv.goBack() })
+                  row.addView(tb("Forward") { if (wv.canGoForward()) wv.goForward() })
+                  row.addView(tb("Reload") { wv.reload() })
+                  row.addView(tb("Save") { saveBookmark() })
+                  row.addView(tb("Bookmarks") { showList("Bookmarks", "bm") })
+                  row.addView(tb("History") { showList("History", "hist") })
+                  privB = tb("Private: off") { priv = !priv; privB.text = if (priv) "Private: ON" else "Private: off" }
+                  row.addView(privB)
+                  shB = tb("Shields: ON") { block = !block; shB.text = if (block) "Shields: ON" else "Shields: off" }
+                  row.addView(shB)
+                  castV = tb("Cast video") { castVideo() }
+                  row.addView(castV)
+                  row.addView(tb("Cast screen") { castScreen() })
+                  row.addView(tb("Clear data") { wipe(); toast("Cleared") })
+                  val hs = HorizontalScrollView(this)
+                  hs.addView(row)
+                  root.addView(hs)
+                  setContentView(root)
+                  setup()
+                  go(intent.getStringExtra("url") ?: "duckduckgo.com")
+              }
+
+              private fun setup() {
+                  val s = wv.settings
+                  s.javaScriptEnabled = true
+                  s.domStorageEnabled = true
+                  s.allowFileAccess = false
+                  s.allowContentAccess = false
+                  s.setGeolocationEnabled(false)
+                  s.mixedContentMode = WebSettings.MIXED_CONTENT_NEVER_ALLOW
+                  s.safeBrowsingEnabled = true
+                  s.javaScriptCanOpenWindowsAutomatically = false
+                  s.setSupportMultipleWindows(false)
+                  CookieManager.getInstance().setAcceptThirdPartyCookies(wv, false)
+                  wv.setDownloadListener { url, ua, cd, mime, _ ->
+                      try {
+                          val r = DownloadManager.Request(Uri.parse(url))
+                          r.setMimeType(mime)
+                          r.addRequestHeader("User-Agent", ua)
+                          r.addRequestHeader("Cookie", CookieManager.getInstance().getCookie(url) ?: "")
+                          r.setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
+                          r.setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, URLUtil.guessFileName(url, cd, mime))
+                          getSystemService(DownloadManager::class.java).enqueue(r)
+                          toast("Downloading...")
+                      } catch (e: Exception) { toast("Download failed") }
+                  }
+                  wv.webChromeClient = object : WebChromeClient() {
+                      override fun onProgressChanged(v: WebView, p: Int) { bar.progress = p; bar.visibility = if (p < 100) View.VISIBLE else View.GONE }
+                      override fun onReceivedTitle(v: WebView, t: String) { pageTitle = t }
+                      override fun onGeolocationPermissionsShowPrompt(o: String, cb: GeolocationPermissions.Callback) { cb.invoke(o, false, false) }
+                      override fun onPermissionRequest(r: PermissionRequest) { r.deny() }
+                  }
+                  wv.webViewClient = object : WebViewClient() {
+                      override fun shouldOverrideUrlLoading(v: WebView, r: WebResourceRequest): Boolean {
+                          val u = r.url
+                          if (u.scheme == "http") { v.loadUrl(u.toString().replaceFirst("http://", "https://")); return true }
+                          return u.scheme != "https"
+                      }
+                      override fun shouldInterceptRequest(v: WebView, r: WebResourceRequest): WebResourceResponse? {
+                          val h = r.url.host ?: ""
+                          val p = r.url.path?.lowercase() ?: ""
+                          if (listOf(".mp4", ".webm", ".m3u8", ".mpd", ".mkv", ".mov").any { p.endsWith(it) }) {
+                              media = r.url.toString()
+                              runOnUiThread { castV.text = "Cast video *" }
+                          }
+                          if (block && ads.any { h == it || h.endsWith(".$it") }) {
+                              blocked++
+                              runOnUiThread { shB.text = "Shields: $blocked blocked" }
+                              return WebResourceResponse("text/plain", "utf-8", ByteArrayInputStream(ByteArray(0)))
+                          }
+                          return null
+                      }
+                      override fun onPageStarted(v: WebView, url: String, f: android.graphics.Bitmap?) {
+                          blocked = 0; media = null; addr.setText(url); castV.text = "Cast video"
+                          if (block) shB.text = "Shields: ON"
+                      }
+                      override fun onPageFinished(v: WebView, url: String) {
+                          if (priv) return
+                          val l = Vault.load(this@BrowserActivity, "hist")
+                          val e = clean(pageTitle) + "\t" + url
+                          if (l.firstOrNull() != e) { l.add(0, e); Vault.save(this@BrowserActivity, "hist", l.take(500)) }
+                      }
+                  }
+              }
+
+              private fun saveBookmark() {
+                  val l = Vault.load(this, "bm")
+                  l.add(0, clean(pageTitle) + "\t" + (wv.url ?: ""))
+                  Vault.save(this, "bm", l); toast("Saved (encrypted)")
+              }
+
+              private fun showList(title: String, name: String) {
+                  val l = Vault.load(this, name)
+                  val names = l.take(100).map { it.substringBefore('\t').ifEmpty { it.substringAfter('\t') } } + listOf("Clear all")
+                  AlertDialog.Builder(this).setTitle(title).setItems(names.toTypedArray()) { _, i ->
+                      if (i >= l.take(100).size) { Vault.save(this, name, emptyList()); toast("Cleared") }
+                      else go(l[i].substringAfter('\t'))
+                  }.show()
+              }
+
+              private fun wipe() {
+                  wv.clearCache(true); wv.clearHistory()
+                  CookieManager.getInstance().removeAllCookies(null)
+                  WebStorage.getInstance().deleteAllData()
+              }
+
+              private fun castVideo() {
+                  val m = media; val p = Shared.peer
+                  if (m == null) { toast("No direct video found here. Try Cast screen."); return }
+                  if (p == null) { toast("Pick a device on the main screen first."); return }
+                  val t = clean(pageTitle)
+                  Thread {
+                      try {
+                          val s = Socket()
+                          s.connect(InetSocketAddress(p.host, 45455), 5000)
+                          val out = DataOutputStream(s.getOutputStream())
+                          out.writeByte('V'.code); out.writeUTF(m); out.writeUTF(t); out.flush(); s.close()
+                          runOnUiThread { toast("Playing on ${p.name}") }
+                      } catch (e: Exception) { runOnUiThread { toast("Cast failed") } }
+                  }.start()
+              }
+
+              private fun castScreen() {
+                  if (Shared.peer == null) { toast("Pick a device on the main screen first."); return }
+                  startActivityForResult(getSystemService(MediaProjectionManager::class.java).createScreenCaptureIntent(), 31)
+              }
+
+              override fun onActivityResult(req: Int, res: Int, data: Intent?) {
+                  super.onActivityResult(req, res, data)
+                  val p = Shared.peer
+                  if (req == 31 && res == RESULT_OK && data != null && p != null) {
+                      val i = Intent(this, CastService::class.java)
+                      i.putExtra("code", res); i.putExtra("data", data); i.putExtra("host", p.host)
+                      startForegroundService(i)
+                      toast("Casting this browser to ${p.name}")
+                  }
+              }
+
+              @Deprecated("Deprecated in Java")
+              override fun onBackPressed() { if (wv.canGoBack()) wv.goBack() else super.onBackPressed() }
+
+              override fun onDestroy() {
+                  if (priv) wipe()
+                  wv.destroy()
+                  super.onDestroy()
+              }
+          }
+
+          EOF_2
           mkdir -p $(dirname 'app/src/main/java/com/example/castshare/CastService.kt')
-          cat > 'app/src/main/java/com/example/castshare/CastService.kt' <<'EOF_2'
+          cat > 'app/src/main/java/com/example/castshare/CastService.kt' <<'EOF_3'
           package com.example.castshare
 
           import android.app.*
@@ -88,7 +316,11 @@ jobs:
           import android.media.MediaFormat
           import android.media.projection.MediaProjection
           import android.media.projection.MediaProjectionManager
+          import android.graphics.Bitmap
+          import android.graphics.PixelFormat
+          import android.media.ImageReader
           import android.os.Handler
+          import android.os.HandlerThread
           import android.os.IBinder
           import android.os.Looper
           import android.view.WindowManager
@@ -115,12 +347,13 @@ jobs:
                   val code = i.getIntExtra("code", 0)
                   val data = i.getParcelableExtra<Intent>("data")
                   val host = i.getStringExtra("host")
-                  if (data == null || host == null) { stopSelf(); return START_NOT_STICKY }
-                  Thread { cast(code, data, host) }.start()
+                  val web = i.getBooleanExtra("web", false)
+                  if (data == null || (host == null && !web)) { stopSelf(); return START_NOT_STICKY }
+                  Thread { cast(code, data, host ?: "", web) }.start()
                   return START_NOT_STICKY
               }
 
-              private fun cast(code: Int, data: Intent, host: String) {
+              private fun cast(code: Int, data: Intent, host: String, web: Boolean) {
                   var proj: MediaProjection? = null
                   var enc: MediaCodec? = null
                   var vd: VirtualDisplay? = null
@@ -132,6 +365,37 @@ jobs:
                       pj.registerCallback(object : MediaProjection.Callback() {
                           override fun onStop() { active = false }
                       }, Handler(Looper.getMainLooper()))
+                      if (web) {
+                          val dm = resources.displayMetrics
+                          val k0 = minOf(1f, 1920f / maxOf(dm.widthPixels, dm.heightPixels))
+                          val ww = (dm.widthPixels * k0).toInt() / 2 * 2
+                          val hh = (dm.heightPixels * k0).toInt() / 2 * 2
+                          val ht = HandlerThread("jpg"); ht.start()
+                          val ir = ImageReader.newInstance(ww, hh, PixelFormat.RGBA_8888, 2)
+                          var lastT = 0L
+                          ir.setOnImageAvailableListener({ r ->
+                              val img = r.acquireLatestImage()
+                              if (img != null) {
+                                  try {
+                                      val now = System.currentTimeMillis()
+                                      if (now - lastT >= 33) {
+                                          lastT = now
+                                          val pl = img.planes[0]
+                                          val bmp = Bitmap.createBitmap(pl.rowStride / pl.pixelStride, hh, Bitmap.Config.ARGB_8888)
+                                          bmp.copyPixelsFromBuffer(pl.buffer)
+                                          val bo = ByteArrayOutputStream()
+                                          Bitmap.createBitmap(bmp, 0, 0, ww, hh).compress(Bitmap.CompressFormat.JPEG, 70, bo)
+                                          Web.frame = bo.toByteArray(); Web.seq++
+                                      }
+                                  } finally { img.close() }
+                              }
+                          }, Handler(ht.looper))
+                          vd = pj.createVirtualDisplay("web", ww, hh, dm.densityDpi,
+                              DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR, ir.surface, null, null)
+                          while (active) Thread.sleep(200)
+                          ht.quitSafely()
+                          return
+                      }
 
                       val b = getSystemService(WindowManager::class.java).currentWindowMetrics.bounds
                       var w = b.width(); var h = b.height()
@@ -194,9 +458,9 @@ jobs:
               }
           }
 
-          EOF_2
+          EOF_3
           mkdir -p $(dirname 'app/src/main/java/com/example/castshare/Direct.kt')
-          cat > 'app/src/main/java/com/example/castshare/Direct.kt' <<'EOF_3'
+          cat > 'app/src/main/java/com/example/castshare/Direct.kt' <<'EOF_4'
           package com.example.castshare
 
           import android.content.*
@@ -243,9 +507,9 @@ jobs:
               }
           }
 
-          EOF_3
+          EOF_4
           mkdir -p $(dirname 'app/src/main/java/com/example/castshare/Hub.kt')
-          cat > 'app/src/main/java/com/example/castshare/Hub.kt' <<'EOF_4'
+          cat > 'app/src/main/java/com/example/castshare/Hub.kt' <<'EOF_5'
           package com.example.castshare
 
           import android.app.*
@@ -309,9 +573,9 @@ jobs:
               }
           }
 
-          EOF_4
+          EOF_5
           mkdir -p $(dirname 'app/src/main/java/com/example/castshare/KeepService.kt')
-          cat > 'app/src/main/java/com/example/castshare/KeepService.kt' <<'EOF_5'
+          cat > 'app/src/main/java/com/example/castshare/KeepService.kt' <<'EOF_6'
           package com.example.castshare
 
           import android.app.*
@@ -331,9 +595,9 @@ jobs:
               }
           }
 
-          EOF_5
+          EOF_6
           mkdir -p $(dirname 'app/src/main/java/com/example/castshare/MainActivity.kt')
-          cat > 'app/src/main/java/com/example/castshare/MainActivity.kt' <<'EOF_6'
+          cat > 'app/src/main/java/com/example/castshare/MainActivity.kt' <<'EOF_7'
           package com.example.castshare
 
           import android.Manifest
@@ -387,7 +651,7 @@ jobs:
                   val need = mutableListOf(Manifest.permission.ACCESS_FINE_LOCATION)
                   if (Build.VERSION.SDK_INT >= 33) { need.add(Manifest.permission.POST_NOTIFICATIONS); need.add("android.permission.NEARBY_WIFI_DEVICES") }
                   requestPermissions(need.toTypedArray(), 1)
-                  direct = Direct(this, { showDirect(it) }, { ip -> peer = Peer("Fast link", ip); ui.post { info.text = "Fast link ready. Cast or send now." } })
+                  direct = Direct(this, { showDirect(it) }, { ip -> peer = Peer("Fast link", ip); Shared.peer = peer; ui.post { info.text = "Fast link ready. Cast or send now." } })
                   direct.start()
                   val muted = 0xFF9AA4C0.toInt()
                   val root = LinearLayout(this)
@@ -429,6 +693,8 @@ jobs:
                   c3.addView(btn("Audio output (Bluetooth)", 0xFF2F3B66.toInt()) {
                       startActivity(Intent(Settings.ACTION_BLUETOOTH_SETTINGS))
                   })
+                  c3.addView(btn("Browser mode (no app on the other device)", 0xFF9333EA.toInt()) { startActivity(Intent(this, WebActivity::class.java)) })
+                  c3.addView(btn("Private browser", 0xFF16A34A.toInt()) { startActivity(Intent(this, BrowserActivity::class.java)) })
                   root.addView(c3)
 
                   val sc = ScrollView(this)
@@ -478,7 +744,7 @@ jobs:
                       return
                   }
                   info.text = "Tap a device to select it."
-                  for (p in peers) list.addView(btn(p.name, 0xFF3B4A7A.toInt()) { peer = p; info.text = "Selected: ${p.name}" })
+                  for (p in peers) list.addView(btn(p.name, 0xFF3B4A7A.toInt()) { peer = p; Shared.peer = p; info.text = "Selected: ${p.name}" })
               }
 
               private fun castScreen() {
@@ -606,9 +872,9 @@ jobs:
               }
           }
 
-          EOF_6
+          EOF_7
           mkdir -p $(dirname 'app/src/main/java/com/example/castshare/PlayerActivity.kt')
-          cat > 'app/src/main/java/com/example/castshare/PlayerActivity.kt' <<'EOF_7'
+          cat > 'app/src/main/java/com/example/castshare/PlayerActivity.kt' <<'EOF_8'
           package com.example.castshare
 
           import android.app.Activity
@@ -827,9 +1093,9 @@ jobs:
               }
           }
 
-          EOF_7
+          EOF_8
           mkdir -p $(dirname 'app/src/main/java/com/example/castshare/ReceiverService.kt')
-          cat > 'app/src/main/java/com/example/castshare/ReceiverService.kt' <<'EOF_8'
+          cat > 'app/src/main/java/com/example/castshare/ReceiverService.kt' <<'EOF_9'
           package com.example.castshare
 
           import android.app.*
@@ -951,9 +1217,9 @@ jobs:
               }
           }
 
-          EOF_8
+          EOF_9
           mkdir -p $(dirname 'app/src/main/java/com/example/castshare/ServeService.kt')
-          cat > 'app/src/main/java/com/example/castshare/ServeService.kt' <<'EOF_9'
+          cat > 'app/src/main/java/com/example/castshare/ServeService.kt' <<'EOF_10'
           package com.example.castshare
 
           import android.app.*
@@ -1043,9 +1309,61 @@ jobs:
               }
           }
 
-          EOF_9
+          EOF_10
+          mkdir -p $(dirname 'app/src/main/java/com/example/castshare/Vault.kt')
+          cat > 'app/src/main/java/com/example/castshare/Vault.kt' <<'EOF_11'
+          package com.example.castshare
+
+          import android.content.Context
+          import android.security.keystore.KeyGenParameterSpec
+          import android.security.keystore.KeyProperties
+          import java.io.File
+          import java.security.KeyStore
+          import javax.crypto.Cipher
+          import javax.crypto.KeyGenerator
+          import javax.crypto.SecretKey
+          import javax.crypto.spec.GCMParameterSpec
+
+          /** Encrypted storage (AES-256-GCM, key kept in the Android Keystore and never leaves the secure hardware). */
+          object Vault {
+              private const val ALIAS = "castshare_vault"
+
+              private fun key(): SecretKey {
+                  val ks = KeyStore.getInstance("AndroidKeyStore")
+                  ks.load(null)
+                  val k = ks.getKey(ALIAS, null)
+                  if (k is SecretKey) return k
+                  val g = KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES, "AndroidKeyStore")
+                  g.init(KeyGenParameterSpec.Builder(ALIAS, KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT)
+                      .setBlockModes(KeyProperties.BLOCK_MODE_GCM)
+                      .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE)
+                      .setKeySize(256).build())
+                  return g.generateKey()
+              }
+
+              fun load(ctx: Context, name: String): MutableList<String> {
+                  val f = File(ctx.filesDir, "$name.enc")
+                  if (!f.exists()) return mutableListOf()
+                  return try {
+                      val b = f.readBytes()
+                      val c = Cipher.getInstance("AES/GCM/NoPadding")
+                      c.init(Cipher.DECRYPT_MODE, key(), GCMParameterSpec(128, b.copyOfRange(0, 12)))
+                      String(c.doFinal(b, 12, b.size - 12)).split("\n").filter { it.isNotEmpty() }.toMutableList()
+                  } catch (e: Exception) { mutableListOf() }
+              }
+
+              fun save(ctx: Context, name: String, items: List<String>) {
+                  try {
+                      val c = Cipher.getInstance("AES/GCM/NoPadding")
+                      c.init(Cipher.ENCRYPT_MODE, key())
+                      File(ctx.filesDir, "$name.enc").writeBytes(c.iv + c.doFinal(items.joinToString("\n").toByteArray()))
+                  } catch (e: Exception) {}
+              }
+          }
+
+          EOF_11
           mkdir -p $(dirname 'app/src/main/java/com/example/castshare/ViewerActivity.kt')
-          cat > 'app/src/main/java/com/example/castshare/ViewerActivity.kt' <<'EOF_10'
+          cat > 'app/src/main/java/com/example/castshare/ViewerActivity.kt' <<'EOF_12'
           package com.example.castshare
 
           import android.app.Activity
@@ -1098,28 +1416,429 @@ jobs:
               override fun onDestroy() { Hub.onSize = null; Hub.onEnd = null; super.onDestroy() }
           }
 
-          EOF_10
+          EOF_12
+          mkdir -p $(dirname 'app/src/main/java/com/example/castshare/Web.kt')
+          cat > 'app/src/main/java/com/example/castshare/Web.kt' <<'EOF_13'
+          package com.example.castshare
+
+          import android.net.Uri
+          import android.net.wifi.WifiManager
+          import java.util.concurrent.CopyOnWriteArrayList
+
+          /** Shared state for Browser mode (receiver needs no app, only a web browser). */
+          object Web {
+              class Entry(val uri: Uri, val name: String, val size: Long)
+              val files = CopyOnWriteArrayList<Entry>()
+              @Volatile var token = ""
+              @Volatile var frame: ByteArray? = null
+              @Volatile var seq = 0
+              var hotspot: WifiManager.LocalOnlyHotspotReservation? = null
+          }
+
+          /** The device picked on the main screen, shared with the browser's cast buttons. */
+          object Shared { @Volatile var peer: Peer? = null }
+
+          EOF_13
+          mkdir -p $(dirname 'app/src/main/java/com/example/castshare/WebActivity.kt')
+          cat > 'app/src/main/java/com/example/castshare/WebActivity.kt' <<'EOF_14'
+          package com.example.castshare
+
+          import android.Manifest
+          import android.app.Activity
+          import android.content.Intent
+          import android.graphics.Bitmap
+          import android.graphics.Color
+          import android.graphics.drawable.GradientDrawable
+          import android.media.projection.MediaProjectionManager
+          import android.net.ConnectivityManager
+          import android.net.NetworkCapabilities
+          import android.net.Uri
+          import android.net.wifi.WifiManager
+          import android.os.*
+          import android.provider.OpenableColumns
+          import android.widget.*
+          import com.google.zxing.BarcodeFormat
+          import com.google.zxing.qrcode.QRCodeWriter
+          import java.net.Inet4Address
+          import java.net.NetworkInterface
+          import java.security.SecureRandom
+
+          /** Browser mode: the other device needs no app. It scans a QR code and uses its web browser. */
+          class WebActivity : Activity() {
+              private lateinit var status: TextView
+              private lateinit var box: LinearLayout
+              private val ui = Handler(Looper.getMainLooper())
+              private var hot = false
+
+              private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+              private fun tv(t: String, size: Float, color: Int): TextView {
+                  val v = TextView(this); v.text = t; v.textSize = size; v.setTextColor(color)
+                  v.setPadding(0, dp(6), 0, dp(2)); return v
+              }
+              private fun btn(t: String, color: Int, f: () -> Unit): Button {
+                  val b = Button(this); b.text = t; b.isAllCaps = false; b.setTextColor(Color.WHITE); b.textSize = 16f
+                  val g = GradientDrawable(); g.setColor(color); g.cornerRadius = dp(16).toFloat(); b.background = g
+                  val p = LinearLayout.LayoutParams(-1, -2); p.topMargin = dp(10); b.layoutParams = p
+                  b.setOnClickListener { f() }; return b
+              }
+
+              override fun onCreate(b: Bundle?) {
+                  super.onCreate(b)
+                  val need = mutableListOf(Manifest.permission.ACCESS_FINE_LOCATION)
+                  if (Build.VERSION.SDK_INT >= 33) need.add("android.permission.NEARBY_WIFI_DEVICES")
+                  requestPermissions(need.toTypedArray(), 2)
+                  val root = LinearLayout(this)
+                  root.orientation = LinearLayout.VERTICAL
+                  root.setPadding(dp(18), dp(48), dp(18), dp(24))
+                  val muted = 0xFF9AA4C0.toInt()
+                  root.addView(tv("Browser mode", 28f, Color.WHITE))
+                  root.addView(tv("The other device needs no app. It scans a QR code and opens a web page.", 14f, muted))
+                  root.addView(btn("1. Start (uses Wi-Fi, or makes a hotspot)", 0xFF7C3AED.toInt()) { start() })
+                  root.addView(btn("2. Add files to share", 0xFF0891B2.toInt()) { pick() })
+                  root.addView(btn("3. Share my screen to the browser", 0xFFB45309.toInt()) { cast() })
+                  root.addView(btn("Stop everything", 0xFF9F1239.toInt()) { stopAll() })
+                  status = tv("Not running", 14f, muted)
+                  box = LinearLayout(this); box.orientation = LinearLayout.VERTICAL
+                  root.addView(status); root.addView(box)
+                  val sc = ScrollView(this)
+                  sc.background = GradientDrawable(GradientDrawable.Orientation.TOP_BOTTOM, intArrayOf(0xFF0B1020.toInt(), 0xFF241B4B.toInt()))
+                  sc.addView(root)
+                  setContentView(sc)
+              }
+
+              private fun lanIp(hotspot: Boolean): String? {
+                  val found = mutableListOf<Pair<String, String>>()
+                  for (ni in NetworkInterface.getNetworkInterfaces()) {
+                      if (!ni.isUp || ni.isLoopback) continue
+                      for (a in ni.inetAddresses) if (a is Inet4Address && a.isSiteLocalAddress) found.add(Pair(ni.name, a.hostAddress ?: ""))
+                  }
+                  val ap = found.firstOrNull { it.first.startsWith("ap") || it.first.startsWith("swlan") || (it.first.startsWith("wlan") && it.first != "wlan0") }
+                  val wl = found.firstOrNull { it.first.startsWith("wlan") }
+                  return (if (hotspot) (ap ?: wl) else (wl ?: ap))?.second
+              }
+
+              private fun qr(t: String): Bitmap {
+                  val m = QRCodeWriter().encode(t, BarcodeFormat.QR_CODE, 560, 560)
+                  val bmp = Bitmap.createBitmap(560, 560, Bitmap.Config.RGB_565)
+                  for (x in 0 until 560) for (y in 0 until 560) bmp.setPixel(x, y, if (m.get(x, y)) Color.BLACK else Color.WHITE)
+                  return bmp
+              }
+
+              private fun addQr(caption: String, text: String) {
+                  box.addView(tv(caption, 14f, Color.WHITE))
+                  val iv = ImageView(this); iv.setImageBitmap(qr(text)); iv.setPadding(dp(8), dp(8), dp(8), dp(8))
+                  iv.setBackgroundColor(Color.WHITE)
+                  box.addView(iv, LinearLayout.LayoutParams(dp(240), dp(240)))
+              }
+
+              private fun showLinks(wifiQr: String?) {
+                  val ip = lanIp(hot)
+                  box.removeAllViews()
+                  if (ip == null) { status.text = "Could not find this phone's address. Connect to Wi-Fi and try again."; return }
+                  val url = "http://" + ip + ":8080/" + Web.token + "/"
+                  status.text = "Running. Open this on the other device:\n$url"
+                  if (wifiQr != null) addQr("A. Scan with the other phone's camera to join this phone's Wi-Fi", wifiQr)
+                  addQr(if (wifiQr != null) "B. Then scan this to open the page" else "Scan to open the page (same Wi-Fi)", url)
+              }
+
+              private fun start() {
+                  val chars = "abcdefghjkmnpqrstuvwxyz23456789"
+                  val r = SecureRandom()
+                  Web.token = String(CharArray(8) { chars[r.nextInt(chars.length)] })
+                  startForegroundService(Intent(this, WebService::class.java))
+                  val cm = getSystemService(ConnectivityManager::class.java)
+                  val wifi = cm.getNetworkCapabilities(cm.activeNetwork)?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true
+                  if (wifi) { hot = false; showLinks(null) } else startHotspot()
+              }
+
+              private fun startHotspot() {
+                  status.text = "Starting a private hotspot..."
+                  val wm = applicationContext.getSystemService(WIFI_SERVICE) as WifiManager
+                  try {
+                      wm.startLocalOnlyHotspot(object : WifiManager.LocalOnlyHotspotCallback() {
+                          override fun onStarted(res: WifiManager.LocalOnlyHotspotReservation) {
+                              Web.hotspot = res
+                              var ssid = ""; var pass = ""
+                              if (Build.VERSION.SDK_INT >= 30) {
+                                  val c = res.softApConfiguration
+                                  ssid = c.ssid ?: ""; pass = c.passphrase ?: ""
+                              } else {
+                                  val c = res.wifiConfiguration
+                                  ssid = (c?.SSID ?: "").trim('"'); pass = c?.preSharedKey ?: ""
+                              }
+                              hot = true
+                              ui.postDelayed({ showLinks("WIFI:T:WPA;S:$ssid;P:$pass;;") }, 1500)
+                          }
+                          override fun onFailed(reason: Int) {
+                              ui.post { status.text = "Hotspot failed ($reason). Turn on Location and Wi-Fi, or join the same Wi-Fi on both devices." }
+                          }
+                      }, ui)
+                  } catch (e: Exception) { status.text = "Hotspot failed: " + e.message }
+              }
+
+              private fun pick() {
+                  val i = Intent(Intent.ACTION_OPEN_DOCUMENT)
+                  i.addCategory(Intent.CATEGORY_OPENABLE); i.type = "*/*"
+                  i.putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true)
+                  startActivityForResult(i, 21)
+              }
+
+              private fun cast() {
+                  if (Web.token.isEmpty()) { status.text = "Press Start first."; return }
+                  startActivityForResult(getSystemService(MediaProjectionManager::class.java).createScreenCaptureIntent(), 22)
+              }
+
+              private fun stopAll() {
+                  startService(Intent(this, WebService::class.java).setAction("STOP"))
+                  startService(Intent(this, CastService::class.java).setAction("STOP"))
+                  try { Web.hotspot?.close() } catch (e: Exception) {}
+                  Web.hotspot = null; Web.token = ""; Web.files.clear(); Web.frame = null
+                  box.removeAllViews(); status.text = "Stopped"
+              }
+
+              override fun onActivityResult(req: Int, res: Int, data: Intent?) {
+                  super.onActivityResult(req, res, data)
+                  if (res != RESULT_OK || data == null) return
+                  if (req == 22) {
+                      val i = Intent(this, CastService::class.java)
+                      i.putExtra("code", res); i.putExtra("data", data); i.putExtra("web", true)
+                      startForegroundService(i)
+                      status.append("\nScreen sharing is on. Open 'Watch screen' in the browser.")
+                  } else if (req == 21) {
+                      val uris = mutableListOf<Uri>()
+                      val cd = data.clipData
+                      if (cd != null) { for (n in 0 until cd.itemCount) uris.add(cd.getItemAt(n).uri) } else data.data?.let { uris.add(it) }
+                      for (u in uris) {
+                          var name = "file"; var size = 0L
+                          val c = contentResolver.query(u, null, null, null, null)
+                          if (c != null) {
+                              if (c.moveToFirst()) {
+                                  val a = c.getColumnIndex(OpenableColumns.DISPLAY_NAME); val z = c.getColumnIndex(OpenableColumns.SIZE)
+                                  if (a >= 0) name = c.getString(a)
+                                  if (z >= 0) size = c.getLong(z)
+                              }
+                              c.close()
+                          }
+                          Web.files.add(Web.Entry(u, name, size))
+                      }
+                      status.append("\n" + Web.files.size + " file(s) shared. Refresh the page on the other device.")
+                  }
+              }
+          }
+
+          EOF_14
+          mkdir -p $(dirname 'app/src/main/java/com/example/castshare/WebService.kt')
+          cat > 'app/src/main/java/com/example/castshare/WebService.kt' <<'EOF_15'
+          package com.example.castshare
+
+          import android.app.*
+          import android.content.ContentValues
+          import android.content.Intent
+          import android.content.pm.ServiceInfo
+          import android.graphics.drawable.Icon
+          import android.os.IBinder
+          import android.provider.MediaStore
+          import java.io.*
+          import java.net.*
+
+          /** Tiny web server: any browser on the same Wi-Fi or hotspot can download, play, upload and watch the screen. */
+          class WebService : Service() {
+              private var srv: ServerSocket? = null
+              override fun onBind(i: Intent?): IBinder? = null
+
+              override fun onStartCommand(i: Intent?, f: Int, id: Int): Int {
+                  if (i?.action == "STOP") {
+                      try { srv?.close() } catch (e: Exception) {}
+                      srv = null; stopSelf(); return START_NOT_STICKY
+                  }
+                  val nm = getSystemService(NotificationManager::class.java)
+                  nm.createNotificationChannel(NotificationChannel("web", "Browser mode", NotificationManager.IMPORTANCE_LOW))
+                  val stop = PendingIntent.getService(this, 5, Intent(this, WebService::class.java).setAction("STOP"), PendingIntent.FLAG_IMMUTABLE)
+                  val act = Notification.Action.Builder(Icon.createWithResource(this, android.R.drawable.ic_media_pause), "Stop", stop).build()
+                  startForeground(5, Notification.Builder(this, "web").setSmallIcon(android.R.drawable.ic_menu_share)
+                      .setContentTitle("Browser mode is on").addAction(act).build(), ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
+                  if (srv == null) Thread { loop() }.start()
+                  return START_NOT_STICKY
+              }
+
+              private fun loop() {
+                  try {
+                      val s = ServerSocket()
+                      s.reuseAddress = true
+                      s.receiveBufferSize = 4 shl 20
+                      s.bind(InetSocketAddress(8080))
+                      srv = s
+                      while (true) { val c = s.accept(); Thread { handle(c) }.start() }
+                  } catch (e: Exception) {}
+              }
+
+              private fun line(i: InputStream): String? {
+                  val sb = StringBuilder()
+                  while (true) {
+                      val b = i.read()
+                      if (b < 0) return if (sb.isEmpty()) null else sb.toString()
+                      if (b == '\n'.code) return sb.toString()
+                      if (b != '\r'.code) sb.append(b.toChar())
+                  }
+              }
+
+              private fun send(out: OutputStream, status: String, type: String, body: ByteArray, extra: String = "") {
+                  val h = "HTTP/1.1 $status\r\nContent-Type: $type\r\nContent-Length: ${body.size}\r\nCache-Control: no-store\r\nConnection: close\r\n$extra\r\n"
+                  out.write(h.toByteArray()); out.write(body)
+              }
+              private fun html(out: OutputStream, s: String) = send(out, "200 OK", "text/html; charset=utf-8", s.toByteArray())
+              private fun esc(s: String) = s.replace("&", "&amp;").replace("<", "&lt;").replace("'", "&#39;")
+
+              private fun handle(c: Socket) {
+                  try {
+                      c.use {
+                          val ins = BufferedInputStream(c.getInputStream(), 1 shl 16)
+                          val out = BufferedOutputStream(c.getOutputStream(), 1 shl 20)
+                          val first = line(ins) ?: return
+                          val h = HashMap<String, String>()
+                          while (true) {
+                              val l = line(ins) ?: break
+                              if (l.isEmpty()) break
+                              val k = l.indexOf(':')
+                              if (k > 0) h[l.substring(0, k).lowercase()] = l.substring(k + 1).trim()
+                          }
+                          val p = first.split(" ")
+                          val method = p[0]; val path = p[1].substringBefore('?')
+                          val base = "/" + Web.token
+                          if (path == base) { send(out, "302 Found", "text/plain", ByteArray(0), "Location: $base/\r\n"); out.flush(); return }
+                          if (Web.token.isEmpty() || !path.startsWith("$base/")) {
+                              send(out, "403 Forbidden", "text/plain", "Forbidden".toByteArray()); out.flush(); return
+                          }
+                          val r = path.substring(base.length)
+                          if (r == "/") html(out, index())
+                          else if (r == "/screen") html(out, SCREEN)
+                          else if (r == "/mjpeg") mjpeg(out)
+                          else if (r == "/up" && method == "POST") upload(ins, out, h)
+                          else if (r.startsWith("/f/") || r.startsWith("/v/"))
+                              stream(out, Web.files.getOrNull(r.substring(3).toIntOrNull() ?: -1), h["range"], r.startsWith("/f/"))
+                          else if (r.startsWith("/p/")) html(out, playPage(r.substring(3)))
+                          else send(out, "404 Not Found", "text/plain", "Not found".toByteArray())
+                          out.flush()
+                      }
+                  } catch (e: Exception) {}
+              }
+
+              private fun mjpeg(out: OutputStream) {
+                  out.write("HTTP/1.1 200 OK\r\nContent-Type: multipart/x-mixed-replace; boundary=f\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n".toByteArray())
+                  var seq = -1; var lastSend = 0L
+                  while (true) {
+                      val fr = Web.frame
+                      val now = System.currentTimeMillis()
+                      if (fr != null && (Web.seq != seq || now - lastSend > 1000)) {
+                          seq = Web.seq; lastSend = now
+                          out.write("--f\r\nContent-Type: image/jpeg\r\nContent-Length: ${fr.size}\r\n\r\n".toByteArray())
+                          out.write(fr); out.write("\r\n".toByteArray()); out.flush()
+                      } else Thread.sleep(15)
+                  }
+              }
+
+              private fun upload(ins: InputStream, out: OutputStream, h: Map<String, String>) {
+                  val len = h["content-length"]?.toLongOrNull() ?: 0L
+                  val name = URLDecoder.decode(h["x-name"] ?: "upload.bin", "UTF-8").replace(Regex("[/\\\\]"), "_")
+                  val v = ContentValues()
+                  v.put(MediaStore.Downloads.DISPLAY_NAME, name)
+                  v.put(MediaStore.Downloads.RELATIVE_PATH, "Download/CastShare")
+                  val uri = contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, v) ?: return
+                  contentResolver.openOutputStream(uri)!!.use { o ->
+                      val buf = ByteArray(1 shl 20)
+                      var left = len
+                      while (left > 0) {
+                          val n = ins.read(buf, 0, minOf(buf.size.toLong(), left).toInt())
+                          if (n < 0) break
+                          o.write(buf, 0, n); left -= n
+                      }
+                  }
+                  send(out, "200 OK", "text/plain", "ok".toByteArray())
+              }
+
+              private fun stream(out: OutputStream, e: Web.Entry?, range: String?, download: Boolean) {
+                  if (e == null) { send(out, "404 Not Found", "text/plain", "Not found".toByteArray()); return }
+                  val pfd = contentResolver.openFileDescriptor(e.uri, "r") ?: return
+                  pfd.use { p ->
+                      val size = p.statSize
+                      var start = 0L; var end = size - 1
+                      if (range != null && range.startsWith("bytes=")) {
+                          val x = range.substring(6).split("-")
+                          start = x[0].toLongOrNull() ?: 0L
+                          if (x.size > 1 && x[1].isNotEmpty()) end = x[1].toLong()
+                      }
+                      val len = end - start + 1
+                      val type = contentResolver.getType(e.uri) ?: "application/octet-stream"
+                      val nm = URLEncoder.encode(e.name, "UTF-8").replace("+", "%20")
+                      val disp = if (download) "attachment" else "inline"
+                      val h = StringBuilder(if (range != null) "HTTP/1.1 206 Partial Content\r\n" else "HTTP/1.1 200 OK\r\n")
+                      h.append("Content-Type: $type\r\nAccept-Ranges: bytes\r\nContent-Length: $len\r\n")
+                      h.append("Content-Disposition: $disp; filename*=UTF-8''$nm\r\nConnection: close\r\n")
+                      if (range != null) h.append("Content-Range: bytes $start-$end/$size\r\n")
+                      h.append("\r\n")
+                      out.write(h.toString().toByteArray())
+                      val ins = FileInputStream(p.fileDescriptor)
+                      ins.channel.position(start)
+                      val buf = ByteArray(1 shl 20)
+                      var left = len
+                      while (left > 0) {
+                          val n = ins.read(buf, 0, minOf(buf.size.toLong(), left).toInt())
+                          if (n < 0) break
+                          out.write(buf, 0, n); left -= n
+                      }
+                  }
+              }
+
+              private fun playPage(i: String) = "<!doctype html><meta name=viewport content='width=device-width,initial-scale=1'>" +
+                  "<body style='margin:0;background:#000;color:#fff;font-family:sans-serif'>" +
+                  "<video controls autoplay playsinline style='width:100%;max-height:92vh;background:#000' src='../v/$i'></video>" +
+                  "<p style='padding:0 14px'>Not playing? This browser may not support the video format. " +
+                  "<a style='color:#7dd3fc' href='../f/$i'>Download it</a> and open it in VLC.</p></body>"
+
+              private fun index(): String {
+                  val sb = StringBuilder("<!doctype html><html><head><meta name=viewport content='width=device-width,initial-scale=1'><title>CastShare</title>")
+                  sb.append("<style>body{margin:0;font-family:sans-serif;background:#0b1020;color:#fff;padding:20px}.c{background:#1b2440;border-radius:16px;padding:14px;margin:12px 0}")
+                  sb.append("a.b{display:inline-block;background:#7c3aed;color:#fff;padding:10px 16px;border-radius:10px;text-decoration:none;margin:4px 6px 4px 0}a.d{background:#0891b2}small{color:#9aa4c0}</style></head><body>")
+                  sb.append("<h1>CastShare</h1><small>Connected to a phone</small>")
+                  sb.append("<div class=c><b>Phone screen</b><br><a class=b href='screen'>Watch screen</a></div><div class=c><b>Files from the phone</b><br>")
+                  if (Web.files.isEmpty()) sb.append("<small>Nothing shared yet. Refresh this page after files are added.</small>")
+                  Web.files.forEachIndexed { i, e ->
+                      sb.append("<p>" + esc(e.name) + " <small>" + (e.size / 1048576) + " MB</small><br><a class='b d' href='f/$i'>Download</a><a class=b href='p/$i'>Play</a></p>")
+                  }
+                  sb.append("</div><div class=c><b>Send files to the phone</b><br><input type=file id=f multiple><br><a class=b href='#' onclick='up();return false'>Send</a>")
+                  sb.append("<progress id=p value=0 max=100 style='width:100%'></progress><div id=s></div></div>")
+                  sb.append("<script>function up(){var fs=document.getElementById('f').files;var n=0;function nx(){if(n>=fs.length){document.getElementById('s').textContent='Done';return}")
+                  sb.append("var f=fs[n];var x=new XMLHttpRequest();x.open('POST','up');x.setRequestHeader('X-Name',encodeURIComponent(f.name));")
+                  sb.append("x.upload.onprogress=function(e){document.getElementById('p').value=e.loaded*100/e.total};x.onload=function(){n++;nx()};x.send(f)}nx()}</script></body></html>")
+                  return sb.toString()
+              }
+
+              private val SCREEN = "<!doctype html><meta name=viewport content='width=device-width,initial-scale=1'><body style='margin:0;background:#000'>" +
+                  "<img src='mjpeg' style='width:100vw;height:100vh;object-fit:contain' onclick=\"var s=this.style;s.objectFit=(s.objectFit=='contain'?'cover':(s.objectFit=='cover'?'fill':'contain'))\"></body>"
+          }
+
+          EOF_15
           mkdir -p $(dirname 'build.gradle.kts')
-          cat > 'build.gradle.kts' <<'EOF_11'
+          cat > 'build.gradle.kts' <<'EOF_16'
           plugins {
               id("com.android.application") version "8.5.2" apply false
               id("org.jetbrains.kotlin.android") version "1.9.24" apply false
           }
 
-          EOF_11
+          EOF_16
           mkdir -p $(dirname 'gradle.properties')
-          cat > 'gradle.properties' <<'EOF_12'
+          cat > 'gradle.properties' <<'EOF_17'
           android.useAndroidX=true
 
-          EOF_12
+          EOF_17
           mkdir -p $(dirname 'settings.gradle.kts')
-          cat > 'settings.gradle.kts' <<'EOF_13'
+          cat > 'settings.gradle.kts' <<'EOF_18'
           pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
           dependencyResolutionManagement { repositories { google(); mavenCentral() } }
           rootProject.name = "CastShare"
           include(":app")
 
-          EOF_13
+          EOF_18
           gradle assembleDebug --no-daemon
           cp app/build/outputs/apk/debug/app-debug.apk ../CastShare.apk
           cd .. && gh release create "v$RUN_NO" CastShare.apk --repo "$REPO" --title "CastShare build $RUN_NO" --notes "Download CastShare.apk"
